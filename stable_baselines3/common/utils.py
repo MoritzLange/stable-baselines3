@@ -402,7 +402,7 @@ def get_parameters_by_name(model: th.nn.Module, included_names: Iterable[str]) -
     :return: List of parameters values (Pytorch tensors)
         that matches the queried names.
     """
-    return [param for name, param in model.state_dict().items() if any([key in name for key in included_names])]
+    return [param for name, param in model.state_dict().items() if any([key in name for key in included_names]) and "ofenet" not in name]
 
 
 def zip_strict(*iterables: Iterable) -> Iterable:

@@ -41,6 +41,8 @@ class Actor(BasePolicy):
         features_dim: int,
         activation_fn: Type[nn.Module] = nn.ReLU,
         normalize_images: bool = True,
+        aux_task: str = "no",
+        ofenet = None,
     ):
         super().__init__(
             observation_space,
@@ -50,12 +52,18 @@ class Actor(BasePolicy):
             squash_output=True,
         )
 
+        self.ofenet = ofenet
+        self.aux_task = aux_task
+
+        if aux_task != "no":
+            state_z_dim = ofenet._dim_state_features
+
         self.net_arch = net_arch
-        self.features_dim = features_dim
+        self.features_dim = features_dim if aux_task=="no" else state_z_dim
         self.activation_fn = activation_fn
 
         action_dim = get_action_dim(self.action_space)
-        actor_net = create_mlp(features_dim, action_dim, net_arch, activation_fn, squash_output=True)
+        actor_net = create_mlp(self.features_dim, action_dim, net_arch, activation_fn, squash_output=True)
         # Deterministic action
         self.mu = nn.Sequential(*actor_net)
 
@@ -74,14 +82,16 @@ class Actor(BasePolicy):
 
     def forward(self, obs: th.Tensor) -> th.Tensor:
         # assert deterministic, 'The TD3 actor only outputs deterministic actions'
-        features = self.extract_features(obs)
+        if self.aux_task == "no":
+            features = self.extract_features(obs)
+        else:
+            features = self.ofenet.features_from_states(obs)
         return self.mu(features)
 
-    def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
-        # Note: the deterministic deterministic parameter is ignored in the case of TD3.
+    def _predict(self, observation: th.Tensor = None, deterministic: bool = False) -> th.Tensor:
+        # Note: the deterministic parameter is ignored in the case of TD3.
         #   Predictions are always deterministic.
         return self(observation)
-
 
 class TD3Policy(BasePolicy):
     """
@@ -120,6 +130,8 @@ class TD3Policy(BasePolicy):
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         n_critics: int = 2,
         share_features_extractor: bool = False,
+        aux_task: str = "no",
+        ofenet: nn.Module = None,
     ):
         super().__init__(
             observation_space,
@@ -140,6 +152,8 @@ class TD3Policy(BasePolicy):
 
         actor_arch, critic_arch = get_actor_critic_arch(net_arch)
 
+        self.aux_task = aux_task
+        self.ofenet = ofenet
         self.net_arch = net_arch
         self.activation_fn = activation_fn
         self.net_args = {
@@ -148,6 +162,8 @@ class TD3Policy(BasePolicy):
             "net_arch": actor_arch,
             "activation_fn": self.activation_fn,
             "normalize_images": normalize_images,
+            "aux_task": aux_task,
+            "ofenet": ofenet
         }
         self.actor_kwargs = self.net_args.copy()
         self.critic_kwargs = self.net_args.copy()
@@ -224,8 +240,8 @@ class TD3Policy(BasePolicy):
     def forward(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
         return self._predict(observation, deterministic=deterministic)
 
-    def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
-        # Note: the deterministic deterministic parameter is ignored in the case of TD3.
+    def _predict(self, observation: th.Tensor = None, deterministic: bool = False) -> th.Tensor:
+        # Note: the deterministic parameter is ignored in the case of TD3.
         #   Predictions are always deterministic.
         return self.actor(observation)
 
@@ -336,6 +352,8 @@ class MultiInputPolicy(TD3Policy):
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         n_critics: int = 2,
         share_features_extractor: bool = False,
+        aux_task: str = "no",
+        ofenet: nn.Module = None,  
     ):
         super().__init__(
             observation_space,
@@ -343,11 +361,13 @@ class MultiInputPolicy(TD3Policy):
             lr_schedule,
             net_arch,
             activation_fn,
-            features_extractor_class,
+            features_extractor_class if aux_task == "no" else FlattenExtractor,
             features_extractor_kwargs,
             normalize_images,
             optimizer_class,
             optimizer_kwargs,
             n_critics,
             share_features_extractor,
+            aux_task,
+            ofenet
         )

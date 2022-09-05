@@ -3,8 +3,11 @@ import warnings
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional, Union
 
+import wandb
 import gym
 import numpy as np
+import torch as th
+from torch import nn
 
 from stable_baselines3.common import base_class  # pytype: disable=pyi-error
 from stable_baselines3.common.evaluation import evaluate_policy
@@ -306,6 +309,8 @@ class EvalCallback(EventCallback):
         render: bool = False,
         verbose: int = 1,
         warn: bool = True,
+        ofenet: nn.Module = None,
+        device: str = None
     ):
         super().__init__(callback_after_eval, verbose=verbose)
 
@@ -322,6 +327,9 @@ class EvalCallback(EventCallback):
         self.render = render
         self.warn = warn
 
+        self.ofenet = ofenet
+        self.device = device
+
         # Convert to VecEnv for consistency
         if not isinstance(eval_env, VecEnv):
             eval_env = DummyVecEnv([lambda: eval_env])
@@ -337,7 +345,10 @@ class EvalCallback(EventCallback):
         self.evaluations_length = []
         # For computing success rate
         self._is_success_buffer = []
+        self._ofenet_eval_buffer = []
         self.evaluations_successes = []
+        if wandb.run is None:
+            raise wandb.Error("You must call wandb.init() before WandbCallback()")
 
     def _init_callback(self) -> None:
         # Does not work in some corner cases, where the wrapper is not the same
@@ -349,6 +360,18 @@ class EvalCallback(EventCallback):
             os.makedirs(self.best_model_save_path, exist_ok=True)
         if self.log_path is not None:
             os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+
+        d = {}
+        if "algo" not in d:
+            d["algo"] = type(self.model).__name__
+        for key in self.model.__dict__:
+            if key in wandb.config:
+                continue
+            if type(self.model.__dict__[key]) in [float, int, str]:
+                d[key] = self.model.__dict__[key]
+            else:
+                d[key] = str(self.model.__dict__[key])
+        wandb.config.update(d)
 
         # Init callback called on new best model
         if self.callback_on_new_best is not None:
@@ -370,11 +393,31 @@ class EvalCallback(EventCallback):
             if maybe_is_success is not None:
                 self._is_success_buffer.append(maybe_is_success)
 
+    def _test_ofenet_callback(self, locals_: Dict[str, Any], globals_: Dict[str, Any]) -> None:
+        """
+        Callback to evaluate the ofenet architecture
+        """
+        last_obs = dict(locals_["last_obs"])
+        obs = dict(locals_["observations"])
+        action = locals_["actions"]
+        reward = locals_["rewards"]
+        done = locals_["dones"]
+
+        for key, value in last_obs.items():
+            last_obs[key] = th.from_numpy(value).to(self.device)
+        for key, value in obs.items():
+            obs[key] = th.from_numpy(value).to(self.device)
+        action = th.from_numpy(action).to(self.device)
+        reward = th.from_numpy(reward).to(self.device)
+
+        ofe_eval = self.ofenet.test_ofe(last_obs, action, obs, reward, done)
+        self._ofenet_eval_buffer.append(ofe_eval)
+    
     def _on_step(self) -> bool:
 
         continue_training = True
 
-        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+        if (self.eval_freq > 0 and self.n_calls % self.eval_freq == 0) or self.n_calls==1:
 
             # Sync training and eval env if there is VecNormalize
             if self.model.get_vec_normalize_env() is not None:
@@ -390,6 +433,14 @@ class EvalCallback(EventCallback):
             # Reset success rate buffer
             self._is_success_buffer = []
 
+            # Reset ofenet evaluation buffer
+            self._ofenet_eval_buffer = []
+
+            if self.ofenet is None:
+                callbacks = [self._log_success_callback]
+            else:
+                callbacks = [self._log_success_callback, self._test_ofenet_callback]
+            
             episode_rewards, episode_lengths = evaluate_policy(
                 self.model,
                 self.eval_env,
@@ -398,7 +449,7 @@ class EvalCallback(EventCallback):
                 deterministic=self.deterministic,
                 return_episode_rewards=True,
                 warn=self.warn,
-                callback=self._log_success_callback,
+                callbacks=callbacks,
             )
 
             if self.log_path is not None:
@@ -431,11 +482,26 @@ class EvalCallback(EventCallback):
             self.logger.record("eval/mean_reward", float(mean_reward))
             self.logger.record("eval/mean_ep_length", mean_ep_length)
 
+            wandb_logs = {"Step": self.num_timesteps}
             if len(self._is_success_buffer) > 0:
                 success_rate = np.mean(self._is_success_buffer)
+                wandb_logs["Success rate"] = success_rate
                 if self.verbose > 0:
                     print(f"Success rate: {100 * success_rate:.2f}%")
                 self.logger.record("eval/success_rate", success_rate)
+            
+            if len(self._ofenet_eval_buffer) > 0:
+                values = np.mean(self._ofenet_eval_buffer, axis=0)
+                wandb_logs["test.mae"] = values[0]
+                wandb_logs["test.mae_percent"] = values[1]
+                wandb_logs["test.mape"] = values[2]
+                wandb_logs["test.mse"] = values[3]
+                wandb_logs["test.mse_percent"] = values[4]
+                wandb_logs["test.mspe"] = values[5]
+
+            wandb_logs["Reward"] = mean_reward
+
+            wandb.log(wandb_logs)
 
             # Dump log so the evaluation results are printed with the correct timestep
             self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")

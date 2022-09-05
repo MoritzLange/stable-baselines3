@@ -859,6 +859,8 @@ class ContinuousCritic(BaseModel):
         normalize_images: bool = True,
         n_critics: int = 2,
         share_features_extractor: bool = True,
+        aux_task: str = "no",
+        ofenet: nn.Module = None,
     ):
         super().__init__(
             observation_space,
@@ -867,13 +869,16 @@ class ContinuousCritic(BaseModel):
             normalize_images=normalize_images,
         )
 
+        self.aux_task = aux_task
+        self.ofenet = ofenet
+
         action_dim = get_action_dim(self.action_space)
 
         self.share_features_extractor = share_features_extractor
         self.n_critics = n_critics
         self.q_networks = []
         for idx in range(n_critics):
-            q_net = create_mlp(features_dim + action_dim, 1, net_arch, activation_fn)
+            q_net = create_mlp((features_dim + action_dim) if aux_task=="no" else self.ofenet._dim_state_action_features, 1, net_arch, activation_fn)
             q_net = nn.Sequential(*q_net)
             self.add_module(f"qf{idx}", q_net)
             self.q_networks.append(q_net)
@@ -881,9 +886,12 @@ class ContinuousCritic(BaseModel):
     def forward(self, obs: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, ...]:
         # Learn the features extractor using the policy loss only
         # when the features_extractor is shared with the actor
-        with th.set_grad_enabled(not self.share_features_extractor):
-            features = self.extract_features(obs)
-        qvalue_input = th.cat([features, actions], dim=1)
+        if self.aux_task == "no":
+            with th.set_grad_enabled(not self.share_features_extractor):
+                features = self.extract_features(obs)
+            qvalue_input = th.cat([features, actions], dim=1)
+        else:
+                qvalue_input = self.ofenet.features_from_states_actions(obs, actions)
         return tuple(q_net(qvalue_input) for q_net in self.q_networks)
 
     def q1_forward(self, obs: th.Tensor, actions: th.Tensor) -> th.Tensor:
@@ -892,6 +900,10 @@ class ContinuousCritic(BaseModel):
         This allows to reduce computation when all the estimates are not needed
         (e.g. when updating the policy in TD3).
         """
-        with th.no_grad():
-            features = self.extract_features(obs)
-        return self.q_networks[0](th.cat([features, actions], dim=1))
+        if self.aux_task == "no":
+            with th.no_grad():
+                features = self.extract_features(obs)
+            return self.q_networks[0](th.cat([features, actions], dim=1))
+        else:
+            sa_features = self.ofenet.features_from_states_actions(obs, actions)
+            return self.q_networks[0](sa_features)

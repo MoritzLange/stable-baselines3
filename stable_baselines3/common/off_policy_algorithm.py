@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import gym
 import numpy as np
 import torch as th
+from torch import nn
 
 from stable_baselines3.common.base_class import BaseAlgorithm
 from stable_baselines3.common.buffers import DictReplayBuffer, ReplayBuffer
@@ -101,6 +102,9 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         use_sde_at_warmup: bool = False,
         sde_support: bool = True,
         supported_action_spaces: Optional[Tuple[gym.spaces.Space, ...]] = None,
+        aux_task: str = "no",
+        ofenet: nn.Module = None,
+        pretrain_steps = 0
     ):
 
         super().__init__(
@@ -143,6 +147,12 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             self.policy_kwargs["use_sde"] = self.use_sde
         # For gSDE only
         self.use_sde_at_warmup = use_sde_at_warmup
+
+        self.aux_task = aux_task
+        self.ofenet = ofenet
+        self.pretrain_steps = pretrain_steps
+        self.policy_kwargs["aux_task"] = self.aux_task
+        self.policy_kwargs["ofenet"] = self.ofenet
 
     def _convert_train_freq(self) -> None:
         """
@@ -357,13 +367,38 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             if rollout.continue_training is False:
                 break
 
-            if self.num_timesteps > 0 and self.num_timesteps > self.learning_starts:
-                # If no `gradient_steps` is specified,
-                # do as many gradients steps as steps performed during the rollout
-                gradient_steps = self.gradient_steps if self.gradient_steps >= 0 else rollout.episode_timesteps
+            # if self.aux_task != "no":
+                # replay_data = self.replay_buffer.sample(self.batch_size, env=self._vec_normalize_env) # ofenet will be trained with the same batch_size as the RL algorithm!
+
+            # If no `gradient_steps` is specified,
+            # do as many gradients steps as steps performed during the rollout
+            gradient_steps = self.gradient_steps if self.gradient_steps >= 0 else rollout.episode_timesteps
+
+            # After learning starts, during pretraining for ofenet, train the ofenet only
+            if self.num_timesteps > 0 and self.ofenet is not None and self.num_timesteps > self.learning_starts and \
+                                self.num_timesteps <= (self.learning_starts + self.pretrain_steps):
+                for _ in range(gradient_steps):
+                    replay_data = self.replay_buffer.sample(self.batch_size, env=self._vec_normalize_env)
+                    self.ofenet.state_model.train()
+                    self.ofenet.action_model.train()
+                    self.ofenet.train_ofe(replay_data.observations, replay_data.actions, replay_data.next_observations, replay_data.rewards, replay_data.dones)
+                    self.ofenet.state_model.eval()
+                    self.ofenet.action_model.eval()
+
+            # When learning_starts delay and pretraining of ofenet are done, train ofenet and then the algorithm
+            elif self.num_timesteps > 0 and self.num_timesteps > self.learning_starts + (self.pretrain_steps if self.aux_task != "no" else 0):
                 # Special case when the user passes `gradient_steps=0`
                 if gradient_steps > 0:
                     self.train(batch_size=self.batch_size, gradient_steps=gradient_steps)
+
+                    if self.ofenet is not None:
+                        for _ in range(gradient_steps):
+                            replay_data = self.replay_buffer.sample(self.batch_size, env=self._vec_normalize_env)
+                            self.ofenet.state_model.train()
+                            self.ofenet.action_model.train()
+                            self.ofenet.train_ofe(replay_data.observations, replay_data.actions, replay_data.next_observations, replay_data.rewards, replay_data.dones)
+                            self.ofenet.state_model.eval()
+                            self.ofenet.action_model.eval()
 
         callback.on_training_end()
 

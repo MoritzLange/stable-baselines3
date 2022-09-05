@@ -14,7 +14,7 @@ def evaluate_policy(
     n_eval_episodes: int = 10,
     deterministic: bool = True,
     render: bool = False,
-    callback: Optional[Callable[[Dict[str, Any], Dict[str, Any]], None]] = None,
+    callbacks: Optional[List[Callable[[Dict[str, Any], Dict[str, Any]], None]]] = None,
     reward_threshold: Optional[float] = None,
     return_episode_rewards: bool = False,
     warn: bool = True,
@@ -39,7 +39,7 @@ def evaluate_policy(
     :param n_eval_episodes: Number of episode to evaluate the agent
     :param deterministic: Whether to use deterministic or stochastic actions
     :param render: Whether to render the environment or not
-    :param callback: callback function to do additional checks,
+    :param callbacks: callback functions to do additional checks,
         called after each step. Gets locals() and globals() passed as parameters.
     :param reward_threshold: Minimum expected reward per episode,
         this will raise an error if the performance is not met
@@ -84,6 +84,7 @@ def evaluate_policy(
     episode_starts = np.ones((env.num_envs,), dtype=bool)
     while (episode_counts < episode_count_targets).any():
         actions, states = model.predict(observations, state=states, episode_start=episode_starts, deterministic=deterministic)
+        last_obs = observations # is passed in locals() to the callbacks down below
         observations, rewards, dones, infos = env.step(actions)
         current_rewards += rewards
         current_lengths += 1
@@ -96,8 +97,12 @@ def evaluate_policy(
                 info = infos[i]
                 episode_starts[i] = done
 
-                if callback is not None:
-                    callback(locals(), globals())
+                if callbacks is not None:
+                    if isinstance(callbacks, list):
+                        for callback in callbacks:
+                            callback(locals(), globals())
+                    else:
+                        callbacks(locals(), globals())
 
                 if dones[i]:
                     if is_monitor_wrapped:

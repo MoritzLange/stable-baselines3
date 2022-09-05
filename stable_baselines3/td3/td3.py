@@ -3,7 +3,12 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import gym
 import numpy as np
 import torch as th
+from torch import nn
 from torch.nn import functional as F
+import matplotlib.pyplot as plt
+from matplotlib.pyplot import Line2D
+
+import wandb
 
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.noise import ActionNoise
@@ -12,6 +17,39 @@ from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
 from stable_baselines3.td3.policies import CnnPolicy, MlpPolicy, MultiInputPolicy, TD3Policy
+
+def plot_grad_flow(named_parameters, b=True):
+    '''Plots the gradients flowing through different layers in the net during training.
+    Can be used for checking for possible gradient vanishing / exploding problems.
+    
+    Usage: Plug this function in Trainer class after loss.backwards() as 
+    "plot_grad_flow(self.model.named_parameters())" to visualize the gradient flow'''
+    ave_grads = []
+    max_grads= []
+    layers = []
+    for n, p in named_parameters:
+        if(p.requires_grad) and ("bias" not in n):
+            layers.append(n)
+            ave_grads.append(p.grad.abs().mean())
+            max_grads.append(p.grad.abs().max())
+    max_grads = [m.cpu() for m in max_grads]
+    ave_grads = [a.cpu() for a in ave_grads]
+    plt.figure()
+    plt.gcf().subplots_adjust(bottom=0.4)
+    plt.bar(np.arange(len(max_grads)), max_grads, alpha=0.1, lw=1, color="c")
+    plt.bar(np.arange(len(max_grads)), ave_grads, alpha=0.1, lw=1, color="b")
+    plt.hlines(0, 0, len(ave_grads)+1, lw=2, color="k" )
+    plt.xticks(range(0,len(ave_grads), 1), layers, rotation="vertical")
+    plt.xlim(left=0, right=len(ave_grads))
+    plt.ylim(bottom = -0.001, top=0.02) # zoom in on the lower gradient regions
+    plt.xlabel("Layers")
+    plt.ylabel("average gradient")
+    plt.title("Gradient flow")
+    plt.grid(True)
+    plt.legend([Line2D([0], [0], color="c", lw=4),
+                Line2D([0], [0], color="b", lw=4),
+                Line2D([0], [0], color="k", lw=4)], ['max-gradient', 'mean-gradient', 'zero-gradient'])
+    plt.show(block=b)
 
 
 class TD3(OffPolicyAlgorithm):
@@ -93,6 +131,9 @@ class TD3(OffPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
+        aux_task: str = "no",
+        ofenet: nn.Module = None,
+        pretrain_steps: int = 0,
     ):
 
         super().__init__(
@@ -119,6 +160,9 @@ class TD3(OffPolicyAlgorithm):
             optimize_memory_usage=optimize_memory_usage,
             supported_action_spaces=(gym.spaces.Box),
             support_multi_env=True,
+            aux_task=aux_task,
+            ofenet=ofenet,
+            pretrain_steps=pretrain_steps
         )
 
         self.policy_delay = policy_delay
@@ -147,6 +191,11 @@ class TD3(OffPolicyAlgorithm):
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
 
+        if self.ofenet is not None:
+            # Suppress ofenet training:
+            for param in self.ofenet.parameters():
+                param.requires_grad=False
+
         # Update learning rate according to lr schedule
         self._update_learning_rate([self.actor.optimizer, self.critic.optimizer])
 
@@ -168,7 +217,7 @@ class TD3(OffPolicyAlgorithm):
                 next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
                 next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
                 target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
-
+            
             # Get current Q-values estimates for each critic network
             current_q_values = self.critic(replay_data.observations, replay_data.actions)
 
@@ -183,6 +232,7 @@ class TD3(OffPolicyAlgorithm):
 
             # Delayed policy updates
             if self._n_updates % self.policy_delay == 0:
+
                 # Compute actor loss
                 actor_loss = -self.critic.q1_forward(replay_data.observations, self.actor(replay_data.observations)).mean()
                 actor_losses.append(actor_loss.item())
@@ -192,11 +242,21 @@ class TD3(OffPolicyAlgorithm):
                 actor_loss.backward()
                 self.actor.optimizer.step()
 
-                polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
-                polyak_update(self.actor.parameters(), self.actor_target.parameters(), self.tau)
+                if self.aux_task == "no":
+                    polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
+                    polyak_update(self.actor.parameters(), self.actor_target.parameters(), self.tau)
+                else:
+                    polyak_update([param for name, param in self.critic.named_parameters() if "ofenet" not in name], [param for name, param in self.critic_target.named_parameters() if "ofenet" not in name], self.tau)
+                    polyak_update([param for name, param in self.actor.named_parameters() if "ofenet" not in name], [param for name, param in self.actor_target.named_parameters() if "ofenet" not in name], self.tau)
                 # Copy running stats, see GH issue #996
                 polyak_update(self.critic_batch_norm_stats, self.critic_batch_norm_stats_target, 1.0)
                 polyak_update(self.actor_batch_norm_stats, self.actor_batch_norm_stats_target, 1.0)
+            
+
+        if self.ofenet is not None:
+            # Re-enable ofenet training:
+            for param in self.ofenet.parameters():
+                param.requires_grad=True
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         if len(actor_losses) > 0:

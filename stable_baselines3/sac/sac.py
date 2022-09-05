@@ -4,6 +4,7 @@ import gym
 import numpy as np
 import torch as th
 from torch.nn import functional as F
+from torch import nn
 
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.noise import ActionNoise
@@ -108,6 +109,9 @@ class SAC(OffPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
+        aux_task: str = "no",
+        ofenet: nn.Module = None,
+        pretrain_steps: int = 0,
     ):
 
         super().__init__(
@@ -136,6 +140,9 @@ class SAC(OffPolicyAlgorithm):
             optimize_memory_usage=optimize_memory_usage,
             supported_action_spaces=(gym.spaces.Box),
             support_multi_env=True,
+            aux_task=aux_task,
+            ofenet=ofenet,
+            pretrain_steps=pretrain_steps
         )
 
         self.target_entropy = target_entropy
@@ -192,6 +199,12 @@ class SAC(OffPolicyAlgorithm):
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
+
+        if self.ofenet is not None:
+            # Suppress ofenet training:
+            for param in self.ofenet.parameters():
+                param.requires_grad=False
+
         # Update optimizers learning rate
         optimizers = [self.actor.optimizer, self.critic.optimizer]
         if self.ent_coef_optimizer is not None:
@@ -274,11 +287,19 @@ class SAC(OffPolicyAlgorithm):
 
             # Update target networks
             if gradient_step % self.target_update_interval == 0:
-                polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
+                if self.aux_task == "no":
+                    polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
+                else:
+                    polyak_update([param for name, param in self.critic.named_parameters() if "ofenet" not in name], [param for name, param in self.critic_target.named_parameters() if "ofenet" not in name], self.tau)
                 # Copy running stats, see GH issue #996
                 polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
 
         self._n_updates += gradient_steps
+
+        if self.ofenet is not None:
+            # Re-enable ofenet training:
+            for param in self.ofenet.parameters():
+                param.requires_grad=True
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/ent_coef", np.mean(ent_coefs))

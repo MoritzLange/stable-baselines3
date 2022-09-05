@@ -64,6 +64,8 @@ class Actor(BasePolicy):
         use_expln: bool = False,
         clip_mean: float = 2.0,
         normalize_images: bool = True,
+        aux_task: str = "no",
+        ofenet = None,
     ):
         super().__init__(
             observation_space,
@@ -73,11 +75,17 @@ class Actor(BasePolicy):
             squash_output=True,
         )
 
+        self.ofenet = ofenet
+        self.aux_task = aux_task
+
+        if aux_task != "no":
+            state_z_dim = ofenet._dim_state_features
+        
         # Save arguments to re-create object at loading
         self.use_sde = use_sde
         self.sde_features_extractor = None
         self.net_arch = net_arch
-        self.features_dim = features_dim
+        self.features_dim = features_dim if aux_task=="no" else state_z_dim
         self.activation_fn = activation_fn
         self.log_std_init = log_std_init
         self.sde_net_arch = sde_net_arch
@@ -89,9 +97,9 @@ class Actor(BasePolicy):
             warnings.warn("sde_net_arch is deprecated and will be removed in SB3 v2.4.0.", DeprecationWarning)
 
         action_dim = get_action_dim(self.action_space)
-        latent_pi_net = create_mlp(features_dim, -1, net_arch, activation_fn)
+        latent_pi_net = create_mlp(self.features_dim, -1, net_arch, activation_fn)
         self.latent_pi = nn.Sequential(*latent_pi_net)
-        last_layer_dim = net_arch[-1] if len(net_arch) > 0 else features_dim
+        last_layer_dim = net_arch[-1] if len(net_arch) > 0 else self.features_dim
 
         if self.use_sde:
             self.action_dist = StateDependentNoiseDistribution(
@@ -159,7 +167,11 @@ class Actor(BasePolicy):
         :return:
             Mean, standard deviation and optional keyword arguments.
         """
-        features = self.extract_features(obs)
+        if self.aux_task == "no":
+            features = self.extract_features(obs)
+        else:
+            features = self.ofenet.features_from_states(obs)
+
         latent_pi = self.latent_pi(features)
         mean_actions = self.mu(latent_pi)
 
@@ -236,6 +248,8 @@ class SACPolicy(BasePolicy):
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         n_critics: int = 2,
         share_features_extractor: bool = False,
+        aux_task: str = "no",
+        ofenet: nn.Module = None,
     ):
         super().__init__(
             observation_space,
@@ -252,6 +266,9 @@ class SACPolicy(BasePolicy):
 
         actor_arch, critic_arch = get_actor_critic_arch(net_arch)
 
+        self.aux_task = aux_task
+        self.ofenet = ofenet
+
         self.net_arch = net_arch
         self.activation_fn = activation_fn
         self.net_args = {
@@ -260,6 +277,8 @@ class SACPolicy(BasePolicy):
             "net_arch": actor_arch,
             "activation_fn": self.activation_fn,
             "normalize_images": normalize_images,
+            "aux_task": aux_task,
+            "ofenet": ofenet
         }
         self.actor_kwargs = self.net_args.copy()
 
@@ -491,6 +510,8 @@ class MultiInputPolicy(SACPolicy):
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         n_critics: int = 2,
         share_features_extractor: bool = False,
+        aux_task: str = "no",
+        ofenet: nn.Module = None, 
     ):
         super().__init__(
             observation_space,
@@ -503,11 +524,13 @@ class MultiInputPolicy(SACPolicy):
             sde_net_arch,
             use_expln,
             clip_mean,
-            features_extractor_class,
+            features_extractor_class if aux_task == "no" else FlattenExtractor,
             features_extractor_kwargs,
             normalize_images,
             optimizer_class,
             optimizer_kwargs,
             n_critics,
             share_features_extractor,
+            aux_task,
+            ofenet
         )
